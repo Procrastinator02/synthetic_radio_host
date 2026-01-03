@@ -19,7 +19,8 @@ def run_tests():
         str(test_dir / "test_radio_host.py"),
         "-v",
         "--tb=short",
-        f"--cov={src_dir / 'radio_host_functions'}",
+        f"--cov={src_dir}",
+        "--cov=radio_host_functions",
         "--cov-report=term-missing",
         "--cov-report=html"
     ]

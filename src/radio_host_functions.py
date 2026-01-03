@@ -11,8 +11,7 @@ from functools import reduce
 from operator import add
 from typing import List
 
-from openai import OpenAI
-from elevenlabs.client import ElevenLabs
+import google.generativeai as genai
 from pydub import AudioSegment
 import wikipediaapi
 
@@ -27,16 +26,12 @@ CONFIG = {
     "SCRIPT_TARGET_WORDS": (260, 300),
     "SCRIPT_TARGET_TURNS": (16, 18),
 
-    "OPENAI_MODEL": "gpt-4o-mini",
-    "OPENAI_TEMPERATURE": 0.9,
-
-    "ELEVENLABS_MODEL": "eleven_multilingual_v2",
+    "GEMINI_MODEL": "gemini-3-flash-preview",
+    "GEMINI_TTS_MODEL": "gemini-2.5-flash-preview-tts",
+    "GEMINI_TEMPERATURE": 0.9,
 
     "SPEAKER_A_NAME": "Vijay",
     "SPEAKER_B_NAME": "Neha",
-
-    "VOICE_A": "pNInz6obpgDQGcFmaJgB",
-    "VOICE_B": "21m00Tcm4TlvDq8ikWAM",
 
     "OUTPUT_FILENAME": "synthetic_radio_host.mp3",
 }
@@ -94,18 +89,19 @@ TOPIC:
 """.strip()
 
 
-def generate_script(prompt: str, client: OpenAI) -> str:
-    response = client.chat.completions.create(
-        model=CONFIG["OPENAI_MODEL"],
-        messages=[
-            {"role": "system", "content": "You write natural Hinglish radio conversations."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=CONFIG["OPENAI_TEMPERATURE"],
-        max_tokens=1200,
+def generate_script(prompt: str, model: genai.GenerativeModel) -> str:
+    system_instruction = "You write natural Hinglish radio conversations."
+    full_prompt = f"{system_instruction}\n\n{prompt}"
+    
+    response = model.generate_content(
+        full_prompt,
+        generation_config=genai.types.GenerationConfig(
+            temperature=CONFIG["GEMINI_TEMPERATURE"],
+            max_output_tokens=1200,
+        )
     )
 
-    script = response.choices[0].message.content.strip()
+    script = response.text.strip()
     if not script:
         raise RuntimeError("Empty script")
 
@@ -132,7 +128,16 @@ def clean_for_tts(line: str) -> str:
 # ======================
 
 def generate_audio_segments(script: str) -> List[AudioSegment]:
-    client = ElevenLabs()
+    # Check for Gemini API key
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY not set in environment. "
+            "Please set your Gemini API key as an environment variable."
+        )
+
+    # Initialize Gemini TTS model
+    tts_model = genai.GenerativeModel(CONFIG["GEMINI_TTS_MODEL"])
 
     a = CONFIG["SPEAKER_A_NAME"]
     b = CONFIG["SPEAKER_B_NAME"]
@@ -140,32 +145,66 @@ def generate_audio_segments(script: str) -> List[AudioSegment]:
     segments: List[AudioSegment] = []
 
     for line in script.splitlines():
-        if line.startswith(f"{a}:"):
-            voice = CONFIG["VOICE_A"]
-        elif line.startswith(f"{b}:"):
-            voice = CONFIG["VOICE_B"]
-        else:
+        if not (line.startswith(f"{a}:") or line.startswith(f"{b}:")):
             continue
 
         text = clean_for_tts(line)
         if not text:
             continue
 
-        audio_bytes = client.text_to_speech.convert(
-            text=text,
-            voice_id=voice,
-            model_id=CONFIG["ELEVENLABS_MODEL"],
-            output_format="mp3_44100_128",
-            voice_settings={
-                "stability": 0.30,
-                "similarity_boost": 0.80,
-                "style": 0.55,
-                "use_speaker_boost": True
-            }
-        )
+        try:
+            # Generate speech using Gemini TTS with audio response
+            response = tts_model.generate_content(
+                text,
+                generation_config=genai.types.GenerationConfig(
+                    response_mime_type="audio/mp3"
+                )
+            )
+            
+            # Get audio content from response
+            # Gemini TTS returns audio in response.parts[0].inline_data.data
+            audio_content = None
+            if hasattr(response, 'parts') and response.parts:
+                for part in response.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        if hasattr(part.inline_data, 'data'):
+                            audio_content = part.inline_data.data
+                            break
+                    # Fallback: check for direct audio attributes
+                    if hasattr(part, 'audio') and part.audio:
+                        audio_content = part.audio
+                        break
+                    elif hasattr(part, 'audio_content'):
+                        audio_content = part.audio_content
+                        break
+            
+            # Additional fallback checks
+            if not audio_content:
+                if hasattr(response, 'audio') and response.audio:
+                    audio_content = response.audio
+                elif hasattr(response, 'audio_content'):
+                    audio_content = response.audio_content
+            
+            if not audio_content:
+                logger.warning(f"No audio content in response for: {text[:50]}...")
+                continue
 
-        segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
-        segments.append(segment + AudioSegment.silent(220))
+            # Convert audio content to AudioSegment
+            # Try MP3 first, then let pydub auto-detect
+            try:
+                segment = AudioSegment.from_file(
+                    io.BytesIO(audio_content),
+                    format="mp3"
+                )
+            except Exception:
+                # If MP3 fails, let pydub auto-detect the format
+                segment = AudioSegment.from_file(io.BytesIO(audio_content))
+
+            segments.append(segment + AudioSegment.silent(220))
+
+        except Exception as e:
+            logger.error(f"Failed to generate audio for line: {text[:50]}... Error: {e}")
+            continue
 
     if not segments:
         raise RuntimeError("No audio generated")
