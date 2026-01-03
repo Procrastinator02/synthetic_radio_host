@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 CONFIG = {
     "WIKIPEDIA_MAX_CHARS": 2500,
-    "SCRIPT_TARGET_WORDS": (260, 300),
-    "SCRIPT_TARGET_TURNS": (16, 18),
+    "SCRIPT_TARGET_WORDS": (300, 400),  # Increased for 2+ minutes at ~150 words/min
+    "SCRIPT_TARGET_TURNS": (20, 25),  # More turns for longer conversation
 
     "GEMINI_MODEL": "gemini-3-flash-preview",
     "GEMINI_TTS_MODEL": "gemini-2.5-flash-preview-tts",
@@ -76,9 +76,10 @@ between two radio hosts: {a} and {b}.
 MANDATORY:
 - Start with: "{a}: Hi hello dosto, main {a} hoon..."
 - End with friendly goodbyes from both hosts
-- {wmin}-{wmax} words
+- {wmin}-{wmax} words (MUST be at least 300 words for 2+ minute duration)
 - {tmin}-{tmax} turns
 - Spoken Hinglish only
+- The conversation should be engaging and last at least 2 minutes when spoken
 
 FORMAT (STRICT):
 {a}: ...
@@ -97,7 +98,7 @@ def generate_script(prompt: str, model: genai.GenerativeModel) -> str:
         full_prompt,
         generation_config=genai.types.GenerationConfig(
             temperature=CONFIG["GEMINI_TEMPERATURE"],
-            max_output_tokens=1200,
+            max_output_tokens=2000,  # Increased for longer scripts (2+ minutes)
         )
     )
 
@@ -153,23 +154,26 @@ def generate_audio_segments(script: str) -> List[AudioSegment]:
             continue
 
         try:
-            # Generate speech using Gemini TTS with audio response
-            response = tts_model.generate_content(
-                text,
-                generation_config=genai.types.GenerationConfig(
-                    response_mime_type="audio/mp3"
-                )
-            )
+            # Generate speech using Gemini TTS
+            # TTS models automatically return audio, no need for response_mime_type
+            response = tts_model.generate_content(text)
             
             # Get audio content from response
             # Gemini TTS returns audio in response.parts[0].inline_data.data
             audio_content = None
+            
+            # Check response parts for inline_data (most common for TTS)
             if hasattr(response, 'parts') and response.parts:
                 for part in response.parts:
+                    # Check for inline_data (standard way TTS models return audio)
                     if hasattr(part, 'inline_data') and part.inline_data:
                         if hasattr(part.inline_data, 'data'):
                             audio_content = part.inline_data.data
                             break
+                        elif hasattr(part.inline_data, 'mime_type'):
+                            # Sometimes data is in a different attribute
+                            logger.debug(f"Found inline_data with mime_type: {part.inline_data.mime_type}")
+                    
                     # Fallback: check for direct audio attributes
                     if hasattr(part, 'audio') and part.audio:
                         audio_content = part.audio
@@ -178,15 +182,29 @@ def generate_audio_segments(script: str) -> List[AudioSegment]:
                         audio_content = part.audio_content
                         break
             
-            # Additional fallback checks
+            # Additional fallback checks at response level
             if not audio_content:
                 if hasattr(response, 'audio') and response.audio:
                     audio_content = response.audio
                 elif hasattr(response, 'audio_content'):
                     audio_content = response.audio_content
+                elif hasattr(response, 'candidates') and response.candidates:
+                    # Check candidates if they exist
+                    for candidate in response.candidates:
+                        if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                            for part in candidate.content.parts:
+                                if hasattr(part, 'inline_data') and part.inline_data:
+                                    if hasattr(part.inline_data, 'data'):
+                                        audio_content = part.inline_data.data
+                                        break
             
             if not audio_content:
-                logger.warning(f"No audio content in response for: {text[:50]}...")
+                logger.warning(
+                    f"No audio content in response for: {text[:50]}...\n"
+                    f"Response type: {type(response)}, "
+                    f"Has parts: {hasattr(response, 'parts')}, "
+                    f"Parts count: {len(response.parts) if hasattr(response, 'parts') else 0}"
+                )
                 continue
 
             # Convert audio content to AudioSegment
@@ -196,14 +214,24 @@ def generate_audio_segments(script: str) -> List[AudioSegment]:
                     io.BytesIO(audio_content),
                     format="mp3"
                 )
-            except Exception:
+            except Exception as format_error:
                 # If MP3 fails, let pydub auto-detect the format
-                segment = AudioSegment.from_file(io.BytesIO(audio_content))
+                try:
+                    segment = AudioSegment.from_file(io.BytesIO(audio_content))
+                except Exception as auto_error:
+                    logger.error(
+                        f"Failed to parse audio format. MP3 error: {format_error}, "
+                        f"Auto-detect error: {auto_error}"
+                    )
+                    continue
 
             segments.append(segment + AudioSegment.silent(220))
+            logger.debug(f"Generated audio segment: {len(segment)}ms for text: {text[:30]}...")
 
         except Exception as e:
             logger.error(f"Failed to generate audio for line: {text[:50]}... Error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             continue
 
     if not segments:
